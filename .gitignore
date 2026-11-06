@@ -9,3 +9,11 @@ wheels/
 # Virtual environments
 .venv
 .env
+# Runtime output
+uploaded_datasets/
+generated_charts/
+.pytest_cache/
+
+# Frontend
+node_modules/
+dist/

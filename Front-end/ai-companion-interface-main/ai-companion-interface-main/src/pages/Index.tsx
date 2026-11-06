@@ -2,8 +2,26 @@ import { useRef, useEffect } from 'react';
 import { ChatMessage } from '@/components/ChatMessage';
 import { ChatInput } from '@/components/ChatInput';
 import { useChat } from '@/hooks/useChat';
-import { Loader2, Plus } from 'lucide-react';
+import { BarChart3, Loader2, Plus, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { toast } from 'sonner';
+
+const TITANIC_SUGGESTIONS = [
+  'Show the survival rate by passenger class as a bar chart',
+  'What is the average fare and age by sex?',
+  'Plot the age distribution of passengers',
+];
+
+const DATA_SUGGESTIONS = [
+  'Summarize this dataset',
+  'Show the first 10 rows',
+  'Chart the distribution of the most interesting column',
+];
+
+const GENERAL_SUGGESTIONS = [
+  'Explain overfitting in simple terms',
+  'What can you do with a CSV file?',
+];
 
 const Index = () => {
   const {
@@ -20,48 +38,95 @@ const Index = () => {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [messages, isLoading]);
+
+  const loadSample = async () => {
+    try {
+      const res = await fetch('/samples/titanic.csv');
+      if (!res.ok) throw new Error();
+      const blob = await res.blob();
+      await uploadFile(new File([blob], 'Titanic-Dataset.csv', { type: 'text/csv' }));
+    } catch {
+      toast.error('Could not load the sample dataset.');
+    }
+  };
 
   const hasMessages = messages.length > 0;
+  const suggestions = !sessionInfo
+    ? GENERAL_SUGGESTIONS
+    : /titanic/i.test(sessionInfo.filename)
+      ? TITANIC_SUGGESTIONS
+      : DATA_SUGGESTIONS;
+
+  const input = (
+    <ChatInput
+      onSendMessage={sendMessage}
+      onUploadFile={uploadFile}
+      isLoading={isLoading}
+      dataset={sessionInfo}
+      onClearFile={clearSession}
+    />
+  );
 
   return (
     <div className="flex flex-col h-screen bg-background">
-      {/* Main Content */}
+      <header className="border-b border-border px-4 py-3">
+        <div className="max-w-3xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 rounded-lg bg-primary text-primary-foreground flex items-center justify-center">
+              <BarChart3 className="w-4 h-4" />
+            </div>
+            <span className="font-semibold text-foreground">CSV Insight Agent</span>
+          </div>
+          {hasMessages && (
+            <Button variant="outline" size="sm" onClick={clearMessages} className="gap-2">
+              <Plus className="w-4 h-4" />
+              New chat
+            </Button>
+          )}
+        </div>
+      </header>
+
       <main className="flex-1 flex flex-col overflow-hidden">
         {!hasMessages ? (
-          /* Initial centered state */
           <div className="flex-1 flex flex-col items-center justify-center px-4">
-            <h2 className="text-2xl font-semibold text-foreground mb-6">
-              How can I help you today?
-            </h2>
-            <ChatInput
-              onSendMessage={sendMessage}
-              onUploadFile={uploadFile}
-              isLoading={isLoading}
-              uploadedFileName={sessionInfo?.filename}
-              onClearFile={clearSession}
-            />
-            <p className="mt-4 text-sm text-muted-foreground">
-              Upload a CSV file to analyze data, or just ask a question
+            <h1 className="text-3xl font-semibold text-foreground mb-2 text-center">
+              Ask your data anything
+            </h1>
+            <p className="text-muted-foreground mb-8 text-center max-w-md">
+              Upload a CSV and the agent writes SQL, analyzes the results and draws charts.
+              Or just ask a question.
             </p>
+            {input}
+            <div className="mt-5 flex flex-wrap justify-center gap-2 max-w-2xl">
+              {!sessionInfo && (
+                <button
+                  type="button"
+                  onClick={loadSample}
+                  disabled={isLoading}
+                  className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-full bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50 transition-opacity"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  Try the Titanic sample
+                </button>
+              )}
+              {suggestions.map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={() => sendMessage(s)}
+                  disabled={isLoading}
+                  className="text-sm px-3 py-1.5 rounded-full border border-border text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-50 transition-colors"
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
           </div>
         ) : (
-          /* Chat view */
           <>
             <div className="flex-1 overflow-y-auto px-4 py-6">
               <div className="max-w-3xl mx-auto space-y-4">
-                {/* New Chat Button */}
-                <div className="flex justify-end mb-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={clearMessages}
-                    className="gap-2"
-                  >
-                    <Plus className="w-4 h-4" />
-                    New Chat
-                  </Button>
-                </div>
                 {messages.map((message) => (
                   <ChatMessage
                     key={message.id}
@@ -72,8 +137,9 @@ const Index = () => {
                 ))}
                 {isLoading && (
                   <div className="flex justify-start">
-                    <div className="bg-chat-assistant rounded-2xl px-4 py-3">
-                      <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+                    <div className="bg-chat-assistant rounded-2xl px-4 py-3 flex items-center gap-2 text-sm text-muted-foreground">
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      {sessionInfo ? 'Querying and analyzing your data…' : 'Thinking…'}
                     </div>
                   </div>
                 )}
@@ -81,16 +147,7 @@ const Index = () => {
               </div>
             </div>
 
-            {/* Input at bottom */}
-            <div className="border-t border-border p-4">
-              <ChatInput
-                onSendMessage={sendMessage}
-                onUploadFile={uploadFile}
-                isLoading={isLoading}
-                uploadedFileName={sessionInfo?.filename}
-                onClearFile={clearSession}
-              />
-            </div>
+            <div className="border-t border-border p-4">{input}</div>
           </>
         )}
       </main>

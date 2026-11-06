@@ -7,34 +7,43 @@ import pandas as pd
 import json
 import duckdb
 import os
+import re
 import uuid
+import traceback
 from pathlib import Path
 from openai import OpenAI
 import shutil
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
-from helper import get_openai_api_key
+from helper import get_llm_api_key, load_env
+
+load_env()
 
 # Initialize FastAPI app
 app = FastAPI(
     title="CSV Agent API",
     description="An AI agent that can answer general questions and analyze CSV datasets when provided",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this for production
+    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize OpenAI client
-client = OpenAI(api_key=get_openai_api_key())
-MODEL = "gpt-4o-mini"
+# LLM client. Gemini is used through its OpenAI-compatible endpoint, so any
+# OpenAI-compatible provider works by changing LLM_BASE_URL and LLM_MODEL.
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+MODEL = os.getenv("LLM_MODEL", "gemini-3.5-flash-lite")
+client = OpenAI(api_key=get_llm_api_key() or "missing-api-key", base_url=LLM_BASE_URL)
+
+# Cap on rows sent back to the model from a SQL query, to keep prompts small
+MAX_RESULT_ROWS = 200
 
 # Directory to store uploaded files and generated charts
 UPLOAD_DIR = Path("uploaded_datasets")
@@ -52,7 +61,7 @@ active_sessions = {}
 
 # Pydantic models
 class ChatRequest(BaseModel):
-    session_id: Optional[str] = None  # Now optional
+    session_id: Optional[str] = None
     message: str
 
 
@@ -71,16 +80,10 @@ class SessionInfo(BaseModel):
     row_count: int
 
 
-class VisualizationConfig(BaseModel):
-    chart_type: str
-    x_axis: str
-    y_axis: str
-    title: str
-
-
 # Prompts
 SQL_GENERATION_PROMPT = """
-Generate an SQL query based on a prompt. Do not reply with anything besides the SQL query.
+Generate a DuckDB SQL query based on a prompt. Do not reply with anything besides the SQL query.
+Only write read-only SELECT (or WITH ... SELECT) queries.
 The prompt is: {prompt}
 
 The available columns are: {columns}
@@ -92,41 +95,63 @@ Analyze the following data: {data}
 Your job is to answer the following question: {prompt}
 """
 
-CHART_CONFIGURATION_PROMPT = """
-Generate a chart configuration based on this data: {data}
-The goal is to show: {visualization_goal}
-"""
-
 CREATE_CHART_PROMPT = """
-Write python code to create a chart based on the following configuration.
+Write python code that creates a clear, well-labelled chart for this goal: {visualization_goal}
 Only return the code, no other text.
-Use matplotlib and pandas. The data is already loaded as a pandas DataFrame called 'df'.
+Use matplotlib and pandas. The data is already loaded as a pandas DataFrame called 'df'
+with these columns: {columns}
+Here is a preview of the data:
+{data}
+Pick a suitable chart type, and set a title and axis labels.
 The code should create the plot but NOT call plt.show() or plt.savefig().
 Just create the figure and plot, we'll handle saving it.
-config: {config}
 """
 
 SYSTEM_PROMPT_WITH_DATA = """
 You are a helpful assistant that can answer questions about the user's uploaded dataset.
 You have access to tools for database lookup, data analysis, and visualization generation.
 The user has uploaded a dataset, so you can use the data analysis tools when needed.
+Always call lookup_given_dataset before analyze_given_dataset or generate_visualization.
+Format answers in Markdown; use tables for tabular results. Charts are shown to the user
+automatically below your answer, so do not include image links,
+code, or remarks about where the chart is shown.
 """
 
 SYSTEM_PROMPT_GENERAL = """
-You are a helpful AI assistant. You can answer general questions, help with various tasks, 
+You are a helpful AI assistant. You can answer general questions, help with various tasks,
 and provide information on a wide range of topics.
 
-If the user wants to analyze data, inform them that they can upload a CSV file to enable 
+If the user wants to analyze data, inform them that they can upload a CSV file to enable
 data analysis features including SQL queries, data analysis, and visualization generation.
 """
+
+
+def strip_code_fences(text: str) -> str:
+    """Remove Markdown code fences (```sql, ```python, ```) from model output."""
+    return re.sub(r"```[a-zA-Z]*", "", text or "").strip()
+
+
+def friendly_error(e: Exception) -> str:
+    """Short, user-facing message for an LLM/provider error."""
+    if getattr(e, "status_code", None) == 429 or "RESOURCE_EXHAUSTED" in str(e):
+        return ("The AI model's rate limit or daily quota has been reached. "
+                "Please wait a bit and try again, or set LLM_MODEL to another model.")
+    if getattr(e, "status_code", None) in (401, 403):
+        return "The AI provider rejected the API key. Check GEMINI_API_KEY in your .env file."
+    return f"Error processing request: {e}"
+
+
+def is_data_session(session_id: Optional[str]) -> bool:
+    session = active_sessions.get(session_id) if session_id else None
+    return bool(session and "dataset_path" in session)
 
 
 # Tool implementations
 def generate_sql_query(prompt: str, columns: list, table_name: str) -> str:
     """Generate an SQL query based on a prompt"""
     formatted_prompt = SQL_GENERATION_PROMPT.format(
-        prompt=prompt, 
-        columns=columns, 
+        prompt=prompt,
+        columns=columns,
         table_name=table_name
     )
 
@@ -134,8 +159,20 @@ def generate_sql_query(prompt: str, columns: list, table_name: str) -> str:
         model=MODEL,
         messages=[{"role": "user", "content": formatted_prompt}],
     )
-    
-    return response.choices[0].message.content # type: ignore
+
+    return response.choices[0].message.content or ""
+
+
+def run_sql(sql_query: str, df: pd.DataFrame, table_name: str) -> pd.DataFrame:
+    """Run a read-only query against df, registered under table_name."""
+    if not re.match(r"^\s*(select|with)\b", sql_query, re.IGNORECASE):
+        raise ValueError(f"Only SELECT queries are allowed, got: {sql_query[:80]}")
+    con = duckdb.connect()
+    try:
+        con.register(table_name, df)
+        return con.execute(sql_query).df()
+    finally:
+        con.close()
 
 
 def lookup_given_dataset(prompt: str, session_id: str) -> str:
@@ -144,21 +181,17 @@ def lookup_given_dataset(prompt: str, session_id: str) -> str:
         session = active_sessions.get(session_id)
         if not session or "dataset_path" not in session:
             return "Error: No dataset found. Please upload a CSV file first to use data analysis features."
-        
-        dataset_path = session["dataset_path"]
-        table_name = session["table_name"]
-        
-        # Read the CSV file
-        df = pd.read_csv(dataset_path)
-        duckdb.sql(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM df")
 
-        # Generate SQL query
-        sql_query = generate_sql_query(prompt, df.columns.tolist(), table_name)
-        sql_query = sql_query.strip().replace("```sql", "").replace("```", "")
-        
-        # Execute the SQL query
-        result = duckdb.sql(sql_query).df()
-        
+        df = pd.read_csv(session["dataset_path"])
+        sql_query = strip_code_fences(generate_sql_query(prompt, df.columns.tolist(), session["table_name"]))
+        result = run_sql(sql_query, df, session["table_name"])
+
+        # Keep the result so charts plot the queried data, not the raw file
+        session["last_result"] = result
+
+        if len(result) > MAX_RESULT_ROWS:
+            return (result.head(MAX_RESULT_ROWS).to_string()
+                    + f"\n... ({len(result)} rows total, showing first {MAX_RESULT_ROWS})")
         return result.to_string()
     except Exception as e:
         return f"Error accessing data: {str(e)}"
@@ -172,107 +205,66 @@ def analyze_given_dataset(prompt: str, data: str) -> str:
         model=MODEL,
         messages=[{"role": "user", "content": formatted_prompt}],
     )
-    
+
     analysis = response.choices[0].message.content
     return analysis if analysis else "No analysis could be generated"
 
 
-def extract_chart_config(data: str, visualization_goal: str) -> dict:
-    """Generate chart visualization configuration"""
-    formatted_prompt = CHART_CONFIGURATION_PROMPT.format(
-        data=data,
-        visualization_goal=visualization_goal
+def create_chart(data: str, visualization_goal: str, columns: list) -> str:
+    """Ask the model for matplotlib code that charts df for the given goal"""
+    formatted_prompt = CREATE_CHART_PROMPT.format(
+        visualization_goal=visualization_goal,
+        columns=columns,
+        data=data[:4000],
     )
 
-    response = client.beta.chat.completions.parse(
-        model=MODEL,
-        messages=[{"role": "user", "content": formatted_prompt}],
-        response_format=VisualizationConfig,
-    )
-    
-    try:
-        content = response.choices[0].message.parsed
-        
-        return {
-            "chart_type": content.chart_type, # type: ignore
-            "x_axis": content.x_axis, # type: ignore
-            "y_axis": content.y_axis, # type: ignore
-            "title": content.title, # type: ignore
-            "data": data
-        }
-    except Exception:
-        return {
-            "chart_type": "line", 
-            "x_axis": "index",
-            "y_axis": "value",
-            "title": visualization_goal,
-            "data": data
-        }
-
-
-def create_chart(config: dict) -> str:
-    """Create chart code based on configuration"""
-    formatted_prompt = CREATE_CHART_PROMPT.format(config=config)
-    
     response = client.chat.completions.create(
         model=MODEL,
         messages=[{"role": "user", "content": formatted_prompt}],
     )
-    
-    code = response.choices[0].message.content
-    code = code.replace("```python", "").replace("```", "").strip() # type: ignore
-    
-    return code
+
+    return strip_code_fences(response.choices[0].message.content or "")
 
 
-def execute_visualization_code(code: str, data_str: str, session_id: str) -> Optional[str]:
+def chart_dataframe(session: dict) -> pd.DataFrame:
+    """The data a chart should plot: the last query result, else the full dataset."""
+    last_result = session.get("last_result")
+    if isinstance(last_result, pd.DataFrame) and not last_result.empty:
+        return last_result.copy()
+    return pd.read_csv(session["dataset_path"])
+
+
+def execute_visualization_code(code: str, df: pd.DataFrame) -> Optional[str]:
+    """Run generated matplotlib code against df and save the figure. Returns its URL."""
     try:
-        session = active_sessions.get(session_id)
-        if not session or "dataset_path" not in session:
-            print("Error: No dataset found in session")
-            return None
-
-        df = pd.read_csv(session["dataset_path"])
-
+        plt.close("all")
         plt.figure(figsize=(10, 6))
-
-        exec_globals = {
-            "df": df,
-            "plt": plt,
-            "pd": pd,
-            "config": extract_chart_config(data_str, "auto")  # 🔥 ADD THIS
-        }
-
-        exec(code, exec_globals)
+        exec(code, {"df": df, "plt": plt, "pd": pd})
 
         chart_filename = f"chart_{uuid.uuid4()}.png"
-        chart_path = CHARTS_DIR / chart_filename
-
-        plt.savefig(chart_path, format="png", bbox_inches="tight", dpi=100)
-        plt.close("all")
-
+        plt.savefig(CHARTS_DIR / chart_filename, format="png", bbox_inches="tight", dpi=100)
         return f"/charts/{chart_filename}"
-
     except Exception as e:
         print(f"Error executing visualization code: {str(e)}")
-        import traceback
         traceback.print_exc()
         return None
-
+    finally:
+        plt.close("all")
 
 
 def generate_visualization(data: str, visualization_goal: str, session_id: str) -> tuple[str, Optional[str]]:
     """Generate a visualization based on the data and goal, return code and chart URL"""
-    config = extract_chart_config(data, visualization_goal)
-    code = create_chart(config)
-    
-    # Execute the code to generate and save the image
-    chart_url = execute_visualization_code(code, data, session_id)
-    
+    session = active_sessions.get(session_id)
+    if not session or "dataset_path" not in session:
+        return "Error: No dataset found in session", None
+
+    df = chart_dataframe(session)
+    code = create_chart(data, visualization_goal, df.columns.tolist())
+    chart_url = execute_visualization_code(code, df)
     return code, chart_url
 
 
-# Tool definitions for OpenAI (only used when dataset is available)
+# Tool definitions (only used when a dataset is available)
 tools = [
     {
         "type": "function",
@@ -283,7 +275,7 @@ tools = [
                 "type": "object",
                 "properties": {
                     "prompt": {
-                        "type": "string", 
+                        "type": "string",
                         "description": "The unchanged prompt that the user provided."
                     }
                 },
@@ -294,17 +286,17 @@ tools = [
     {
         "type": "function",
         "function": {
-            "name": "analyze_given_dataset", 
+            "name": "analyze_given_dataset",
             "description": "Analyze given data to extract insights",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "data": {
-                        "type": "string", 
+                        "type": "string",
                         "description": "The lookup_given_dataset tool's output."
                     },
                     "prompt": {
-                        "type": "string", 
+                        "type": "string",
                         "description": "The unchanged prompt that the user provided."
                     }
                 },
@@ -316,16 +308,16 @@ tools = [
         "type": "function",
         "function": {
             "name": "generate_visualization",
-            "description": "Generate Python matplotlib code to create data visualizations",
+            "description": "Generate a matplotlib chart from the data returned by lookup_given_dataset",
             "parameters": {
-                "type": "object", 
+                "type": "object",
                 "properties": {
                     "data": {
-                        "type": "string", 
+                        "type": "string",
                         "description": "The lookup_given_dataset tool's output."
                     },
                     "visualization_goal": {
-                        "type": "string", 
+                        "type": "string",
                         "description": "The goal of the visualization."
                     }
                 },
@@ -337,110 +329,85 @@ tools = [
 
 
 def handle_tool_calls(tool_calls, messages, session_id):
-    """Execute tools and append results to messages"""
+    """Execute tools and append results to messages.
+
+    Returns (messages, chart_urls, visualization_code).
+    """
     chart_urls = []
-    
+    visualization_code = None
+
     tool_implementations = {
         "lookup_given_dataset": lambda **kwargs: lookup_given_dataset(session_id=session_id, **kwargs),
-        "analyze_given_dataset": analyze_given_dataset, 
+        "analyze_given_dataset": analyze_given_dataset,
         "generate_visualization": lambda **kwargs: generate_visualization(session_id=session_id, **kwargs)
     }
-    
-    for tool_call in tool_calls:   
-        function = tool_implementations[tool_call.function.name]
-        function_args = json.loads(tool_call.function.arguments)
-        result = function(**function_args)
-        
-        # Handle visualization results (returns tuple of code and chart URL)
-        if tool_call.function.name == "generate_visualization":
+
+    for tool_call in tool_calls:
+        name = tool_call.function.name
+        try:
+            function = tool_implementations[name]
+            function_args = json.loads(tool_call.function.arguments or "{}")
+            result = function(**function_args)
+        except Exception as e:
+            result = f"Error running tool {name}: {e}"
+
+        # Visualization returns (code, chart_url)
+        if name == "generate_visualization" and isinstance(result, tuple):
             code, chart_url = result
+            visualization_code = code
             if chart_url:
                 chart_urls.append(chart_url)
-            result = code  # Store code in messages for reference
-        
+                result = f"Chart created successfully. Code used:\n{code}"
+            else:
+                result = f"Chart could not be created. Code attempted:\n{code}"
+
         messages.append({
-            "role": "tool", 
-            "content": result, 
+            "role": "tool",
+            "content": str(result),
             "tool_call_id": tool_call.id
         })
-        
-    return messages, chart_urls
+
+    return messages, chart_urls, visualization_code
 
 
 def run_agent_with_data(messages, session_id):
     """Agent with data analysis capabilities"""
     if isinstance(messages, str):
         messages = [{"role": "user", "content": messages}]
-        
-    # Add system prompt for data mode
+
     if not any(msg.get("role") == "system" for msg in messages):
         messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT_WITH_DATA})
 
     visualization_code = None
     all_chart_urls = []
-    
+
     max_iterations = 10  # Prevent infinite loops
-    iteration = 0
-    
-    while iteration < max_iterations:
-        iteration += 1
-        
+
+    for iteration in range(1, max_iterations + 1):
         try:
-            # Convert messages to proper format for API
-            api_messages = []
-            for msg in messages:
-                if isinstance(msg, dict):
-                    api_messages.append(msg)
-                else:
-                    # Handle case where message might be an object
-                    api_messages.append({
-                        "role": getattr(msg, "role", "user"),
-                        "content": getattr(msg, "content", str(msg))
-                    })
-            
             response = client.chat.completions.create(
                 model=MODEL,
-                messages=api_messages,
-                tools=tools, # type: ignore
+                messages=messages,
+                tools=tools,  # type: ignore
             )
-            
-            # Convert response message to dict before appending
             response_msg = response.choices[0].message
-            msg_dict = {
-                "role": response_msg.role,
-                "content": response_msg.content
-            }
-            
-            # Add tool_calls if they exist
-            if response_msg.tool_calls:
-                msg_dict["tool_calls"] = response_msg.tool_calls
-            
-            messages.append(msg_dict)
-            tool_calls = response_msg.tool_calls
 
-            if tool_calls:
-                messages, chart_urls = handle_tool_calls(tool_calls, messages, session_id)
-                
-                # Collect all generated chart URLs
-                if chart_urls:
-                    all_chart_urls.extend(chart_urls)
-                
-                # Check if visualization was generated (for backward compatibility)
-                for tool_call in tool_calls:
-                    if tool_call.function.name == "generate_visualization": # type: ignore
-                        function_args = json.loads(tool_call.function.arguments) # type: ignore
-                        code, _ = generate_visualization(session_id=session_id, **function_args)
-                        visualization_code = code
-            else:
+            if not response_msg.tool_calls:
                 return response_msg.content, visualization_code, all_chart_urls
-                
+
+            # model_dump keeps provider extras (e.g. Gemini thought signatures)
+            # that must be sent back on the next turn.
+            messages.append(response_msg.model_dump(exclude_none=True))
+            messages, chart_urls, code = handle_tool_calls(response_msg.tool_calls, messages, session_id)
+            all_chart_urls.extend(chart_urls)
+            if code:
+                visualization_code = code
+
         except Exception as e:
             print(f"Error in agent iteration {iteration}: {str(e)}")
-            import traceback
             traceback.print_exc()
-            # Return whatever we have so far
-            return f"Error processing request: {str(e)}", visualization_code, all_chart_urls
-    
+            return friendly_error(e), visualization_code, all_chart_urls
+
     return "Maximum iterations reached", visualization_code, all_chart_urls
 
 
@@ -448,16 +415,19 @@ def run_agent_general(messages):
     """Agent for general conversation without data tools"""
     if isinstance(messages, str):
         messages = [{"role": "user", "content": messages}]
-        
-    # Add system prompt for general mode
+
     if not any(msg.get("role") == "system" for msg in messages):
         messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT_GENERAL})
 
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=messages, # type: ignore
-    )
-    
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,  # type: ignore
+        )
+    except Exception as e:
+        print(f"Error in general agent: {e}")
+        return friendly_error(e), None, None
+
     return response.choices[0].message.content, None, None
 
 
@@ -465,117 +435,77 @@ def run_agent_general(messages):
 @app.post("/upload", response_model=SessionInfo)
 async def upload_dataset(file: UploadFile = File(...)):
     """Upload a CSV dataset and create a new session"""
-    if not file.filename.endswith('.csv'): # type: ignore
+    # Keep only the base name so a crafted filename can't escape UPLOAD_DIR
+    filename = Path(file.filename or "").name
+    if not filename.lower().endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are supported")
-    
+
+    session_id = str(uuid.uuid4())
+    file_path = UPLOAD_DIR / f"{session_id}_{filename}"
+
     try:
-        # Generate unique session ID
-        session_id = str(uuid.uuid4())
-        
-        # Save uploaded file
-        file_path = UPLOAD_DIR / f"{session_id}_{file.filename}"
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        
-        # Read dataset info
         df = pd.read_csv(file_path)
-        
-        # Store session info
-        active_sessions[session_id] = {
-            "dataset_path": str(file_path),
-            "table_name": f"dataset_{session_id.replace('-', '_')}",
-            "filename": file.filename,
-            "columns": df.columns.tolist(),
-            "row_count": len(df),
-            "messages": []
-        }
-        
-        return SessionInfo(
-            session_id=session_id,
-            filename=file.filename, # type: ignore
-            columns=df.columns.tolist(),
-            row_count=len(df)
-        )
-    
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Could not read CSV file: {str(e)}")
+
+    active_sessions[session_id] = {
+        "dataset_path": str(file_path),
+        "table_name": f"dataset_{session_id.replace('-', '_')}",
+        "filename": filename,
+        "columns": df.columns.tolist(),
+        "row_count": len(df),
+        "messages": []
+    }
+
+    return SessionInfo(
+        session_id=session_id,
+        filename=filename,
+        columns=df.columns.tolist(),
+        row_count=len(df)
+    )
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Send a message to the agent (works with or without uploaded data)"""
-    
-    # Determine mode: data analysis or general conversation
-    has_data = request.session_id and request.session_id in active_sessions
-    
     try:
-        if has_data:
-            # Data analysis mode with tools
-            session = active_sessions[request.session_id]
-            
-            # Add user message to conversation history
+        if is_data_session(request.session_id):
+            session_id = request.session_id
+            session = active_sessions[session_id]
             session["messages"].append({"role": "user", "content": request.message})
-            
-            # Run agent with data tools
-            try:
-                response_text, viz_code, chart_urls = run_agent_with_data(
-                    session["messages"].copy(), 
-                    request.session_id
-                )
-            except Exception as agent_error:
-                print(f"Agent error: {str(agent_error)}")
-                import traceback
-                traceback.print_exc()
-                raise HTTPException(status_code=500, detail=f"Agent processing error: {str(agent_error)}")
-            
-            # Update conversation history
-            if response_text:
-                session["messages"].append({"role": "assistant", "content": response_text})
-            
-            return ChatResponse(
-                session_id=request.session_id,
-                response=response_text if response_text else "I encountered an error processing your request.",
-                visualization_code=viz_code,
-                chart_urls=chart_urls if chart_urls else None,
-                mode="data_analysis"
+
+            response_text, viz_code, chart_urls = run_agent_with_data(
+                session["messages"].copy(),
+                session_id
             )
+            mode = "data_analysis"
         else:
-            # General conversation mode without tools
-            # Create a temporary session for conversation history if needed
-            temp_session_id = "general_" + str(uuid.uuid4())
-            
-            if temp_session_id not in active_sessions:
-                active_sessions[temp_session_id] = {"messages": []}
-            
-            temp_session = active_sessions[temp_session_id]
-            temp_session["messages"].append({"role": "user", "content": request.message})
-            
-            # Run agent in general mode
-            try:
-                response_text, viz_code, chart_urls = run_agent_general(temp_session["messages"].copy())
-            except Exception as agent_error:
-                print(f"Agent error: {str(agent_error)}")
-                import traceback
-                traceback.print_exc()
-                raise HTTPException(status_code=500, detail=f"Agent processing error: {str(agent_error)}")
-            
-            # Update conversation history
-            if response_text:
-                temp_session["messages"].append({"role": "assistant", "content": response_text})
-            
-            return ChatResponse(
-                session_id=temp_session_id,
-                response=response_text if response_text else "I encountered an error processing your request.",
-                visualization_code=viz_code,
-                chart_urls=None,
-                mode="general"
-            )
-    
-    except HTTPException:
-        raise
+            # Reuse an existing general session so the conversation keeps its memory
+            session_id = request.session_id
+            if not session_id or session_id not in active_sessions:
+                session_id = "general_" + str(uuid.uuid4())
+                active_sessions[session_id] = {"messages": []}
+            session = active_sessions[session_id]
+            session["messages"].append({"role": "user", "content": request.message})
+
+            response_text, viz_code, chart_urls = run_agent_general(session["messages"].copy())
+            mode = "general"
+
+        if response_text:
+            session["messages"].append({"role": "assistant", "content": response_text})
+
+        return ChatResponse(
+            session_id=session_id,
+            response=response_text or "I encountered an error processing your request.",
+            visualization_code=viz_code,
+            chart_urls=chart_urls or None,
+            mode=mode
+        )
     except Exception as e:
         print(f"Unexpected error in chat endpoint: {str(e)}")
-        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error processing message: {str(e)}")
 
@@ -585,13 +515,12 @@ async def get_session(session_id: str):
     """Get information about a session"""
     if session_id not in active_sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
     session = active_sessions[session_id]
-    
-    # Check if this is a data session or general session
+
     if "dataset_path" not in session:
         raise HTTPException(status_code=400, detail="This is a general conversation session, not a data session")
-    
+
     return SessionInfo(
         session_id=session_id,
         filename=session["filename"],
@@ -605,23 +534,12 @@ async def delete_session(session_id: str):
     """Delete a session and its associated data"""
     if session_id not in active_sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-    
-    try:
-        session = active_sessions[session_id]
-        
-        # Delete uploaded file if it exists
-        if "dataset_path" in session:
-            file_path = Path(session["dataset_path"])
-            if file_path.exists():
-                file_path.unlink()
-        
-        # Remove session
-        del active_sessions[session_id]
-        
-        return {"message": "Session deleted successfully"}
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error deleting session: {str(e)}")
+
+    session = active_sessions.pop(session_id)
+    if "dataset_path" in session:
+        Path(session["dataset_path"]).unlink(missing_ok=True)
+
+    return {"message": "Session deleted successfully"}
 
 
 @app.post("/session/create")
@@ -629,7 +547,7 @@ async def create_general_session():
     """Create a new general conversation session without uploading data"""
     session_id = "general_" + str(uuid.uuid4())
     active_sessions[session_id] = {"messages": []}
-    
+
     return {
         "session_id": session_id,
         "mode": "general",
@@ -642,7 +560,8 @@ async def root():
     """Root endpoint"""
     return {
         "message": "CSV Agent API",
-        "version": "1.0.0",
+        "version": "1.1.0",
+        "model": MODEL,
         "modes": {
             "general": "Chat without data - general AI assistant",
             "data_analysis": "Chat with uploaded CSV - full data analysis capabilities"

@@ -26,7 +26,7 @@ export function ChatMessage({ role, content, chartUrls }: ChatMessageProps) {
         }`}
       >
         {isUser ? (
-          <p className="text-foreground">{content}</p>
+          <p className="text-foreground whitespace-pre-wrap">{content}</p>
         ) : (
           <div className="markdown-content text-foreground">
             <ReactMarkdown
@@ -60,13 +60,14 @@ export function ChatMessage({ role, content, chartUrls }: ChatMessageProps) {
                       Failed to load chart image
                     </div>
                   ) : (
-                    <img
-                      key={idx}
-                      src={url}
-                      alt={`Chart ${idx + 1}`}
-                      className="max-w-full rounded-lg border border-border"
-                      onError={() => handleImageError(idx)}
-                    />
+                    <a key={idx} href={url} target="_blank" rel="noreferrer" title="Open full size">
+                      <img
+                        src={url}
+                        alt={`Chart ${idx + 1}`}
+                        className="max-w-full rounded-lg border border-border bg-white"
+                        onError={() => handleImageError(idx)}
+                      />
+                    </a>
                   )
                 )}
               </div>

@@ -1,24 +1,12 @@
-# Add your utilities or helper functions to this file.
-
 import os
 from dotenv import load_dotenv, find_dotenv
-                     
+
+
 def load_env():
-    _ = load_dotenv(find_dotenv(), override=True)
+    load_dotenv(find_dotenv(usecwd=True), override=True)
 
-def get_openai_api_key():
+
+def get_llm_api_key():
+    """API key for the LLM provider. GEMINI_API_KEY wins; OPENAI_API_KEY is a fallback."""
     load_env()
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    return openai_api_key
-
-def get_groq_api_key():
-    load_env()
-    groq_api_key = os.getenv("GROQ_API_KEY")
-    return groq_api_key
-
-def get_phoenix_endpoint():
-    load_env()
-    phoenix_endpoint = os.getenv("PHOENIX_COLLECTOR_ENDPOINT")
-    return phoenix_endpoint
-
-
+    return os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY")

@@ -1,15 +1,13 @@
 [project]
 name = "ai-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "AI data-analysis agent: chat with your CSV files using SQL, LLM analysis and auto-generated charts"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "duckdb>=1.4.3",
     "fastapi>=0.127.0",
     "fastparquet>=2025.12.0",
-    "groq>=1.0.0",
-    "ipykernel>=7.1.0",
     "matplotlib>=3.10.8",
     "openai>=2.14.0",
     "pandas>=2.3.3",
@@ -19,3 +17,12 @@ dependencies = [
     "requests>=2.32.5",
     "uvicorn>=0.40.0",
 ]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.2.0",
+]
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
